@@ -21,6 +21,7 @@ All functions accept an optional ID column (e.g., `resp_id`) as the first column
 | `cluster_lca()` | Latent Class Analysis | Categorical survey questions, pick-any matrices, or ordinal scales where categorical distributions determine groups. | `lca_k` |
 | `cluster_lca2()` | High-Performance LCA | C++ accelerated multi-threaded Latent Class Analysis (via `poLCAParallel`). Dramatically cuts computation runtimes on multi-core CPUs. | `lcaParallel_k` |
 | `cluster_som()` | Self-Organizing Maps | Uncovering multi-dimensional topologies where cluster positioning on a grid displays structural likeness. | `somHex_k` |
+| `cluster_rf()` | Unsupervised Random Forest | Finding organic groupings via tree-ensemble co-occurrence proximities. | `rfWard_k` |
 | `cluster_umap_hdbscan()` | UMAP + HDBSCAN | Modern manifold learning combined with density clustering. Identifies organic cluster boundaries and automatically separates noisy outliers (Cluster 0). | `umaphdb_k` |
 | `cluster_autoencoder()` | Deep Representation Space | Utilizing non-linear neural compression network layers to build a deep feature bottleneck space before segment isolation. | `deepkm_k` |
 
