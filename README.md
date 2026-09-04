@@ -24,6 +24,7 @@ All functions accept an optional ID column (e.g., `resp_id`) as the first column
 | `cluster_rf()` | Unsupervised Random Forest | Finding organic groupings via tree-ensemble co-occurrence proximities. | `rfWard_k` |
 | `cluster_umap_hdbscan()` | UMAP + HDBSCAN | Modern manifold learning combined with density clustering. Identifies organic cluster boundaries and automatically separates noisy outliers (Cluster 0). | `umaphdb_k` |
 | `cluster_autoencoder()` | Deep Representation Space | Utilizing non-linear neural compression network layers to build a deep feature bottleneck space before segment isolation. | `deepkm_k` |
+| `cluster_ensemble()` | Consensus Ensemble | Synthesizing alternative solutions simultaneously. Converts multiple cluster structures into a binary consensus layout to isolate a robust compromise framework. | `ensemble_k` |
 
 ### Output Structure
 Every function returns a `list` containing:
@@ -49,6 +50,7 @@ T.K.
 ## ✨ Usage
 ```r
 source("https://raw.githubusercontent.com/brentfuller-mra/R-segmentation-helpers/main/cluster_generation.R")
+source("https://raw.githubusercontent.com/brentfuller-mra/R-segmentation-helpers/main/cluster_evaluation.R")
 
 km_results <- cluster_km(
   data          = input_data,  # First column = respondent ID string, remaining columns are inputs
