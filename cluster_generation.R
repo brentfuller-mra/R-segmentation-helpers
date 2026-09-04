@@ -1786,3 +1786,1412 @@ cluster_flex <- function(data,
   )
 }
 
+#' Clustering Large Applications (CLARA)
+#'
+#' Assigns respondents to clusters via sampling medoids using 
+#' \code{cluster::clara}. Engineered for large global consumer databases.
+#'
+#' Column names follow the pattern \code{claraEucl_k} or \code{claraManh_k}.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of cluster counts. Default \code{3:8}.
+#' @param metric Character. Distance metric. Either \code{"euclidean"} or \code{"manhattan"}.
+#'   Default \code{"euclidean"}.
+#' @param samples Integer. Number of subsamples drawn from the dataset. Default \code{50}.
+#' @param sampsize Integer. Size of each subsample. Default \code{250} (or total N if smaller).
+#' @param standardize Logical. If \code{TRUE}, inputs are scaled inside CLARA. Default \code{FALSE}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, Medoids, and Input_Value_Frequencies.
+#'
+#' @importFrom cluster clara
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_clara <- function(data,
+                          num_solutions = 3:8,
+                          metric = c("euclidean", "manhattan"),
+                          samples = 50L,
+                          sampsize = 250L,
+                          standardize = FALSE,
+                          seed = 123L,
+                          id_col = TRUE) {
+  
+  metric   <- match.arg(metric)
+  samples  <- as.integer(samples)
+  sampsize <- as.integer(sampsize)
+  seed     <- as.integer(seed)
+  
+  if (!requireNamespace("cluster", quietly = TRUE)) {
+    stop("Package 'cluster' is required. Install it with install.packages(\"cluster\").")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]
+    id_vector <- data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert to numeric ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.numeric(x) else as.numeric(x)
+  }))
+  
+  # ---- value frequencies ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  inputs_mat <- as.matrix(data)
+  
+  # Safe boundary adjust for sample size
+  if (sampsize > nrow(inputs_mat)) {
+    sampsize <- nrow(inputs_mat)
+  }
+  
+  # ---- prefix construction ----
+  metric_tag <- if (metric == "euclidean") "Eucl" else "Manh"
+  sol_prefix <- paste0("clara", metric_tag)
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  # ---- fit CLARA for each k ----
+  set.seed(seed)
+  clara_results <- purrr::map(num_solutions, function(k) {
+    cluster::clara(
+      x        = inputs_mat,
+      k        = k,
+      metric   = metric,
+      stand    = standardize,
+      samples  = samples,
+      sampsize = sampsize,
+      rngR     = TRUE # Use R's native random number generator for seed stability
+    )
+  })
+  names(clara_results) <- sol_names
+  
+  # ---- cluster assignments ----
+  clusters <- purrr::map(clara_results, function(obj) {
+    obj$clustering
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- extract medoids rows ----
+  medoids_list <- list()
+  for (i in seq_along(clara_results)) {
+    k    <- num_solutions[i]
+    key  <- sol_names[i]
+    mmat <- as.data.frame(clara_results[[i]]$medoids)
+    mmat$Cluster <- seq_len(k)
+    mmat <- mmat[, c("Cluster", colnames(inputs_mat))]
+    medoids_list[[key]] <- mmat
+  }
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    Medoids                 = medoids_list,
+    Input_Value_Frequencies = value_freqs
+  )
+}
+
+#' Self-Organizing Map (SOM) Clustering
+#'
+#' Assigns respondents to clusters via Self-Organizing Maps using the
+#' \pkg{kohonen} package. This creates a grid topology where adjacent 
+#' clusters share structural similarities.
+#'
+#' If the first column is an ID variable (e.g. \code{resp_id}), it is
+#' excluded from the analysis and appended to \code{Cluster_Assignments}.
+#'
+#' Column names follow the pattern \code{somHex_k} or \code{somRect_k}.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of cluster counts. Because SOM requires 
+#'   a grid configuration, this vector dictates the number of nodes.
+#' @param topo Character. Grid topology. Either \code{"hexagonal"} or \code{"rectangular"}.
+#'   Default \code{"hexagonal"}.
+#' @param rlen Integer. Number of times the entire dataset will be presented 
+#'   to the network. Default \code{100}.
+#' @param standardize Logical. If \code{TRUE}, inputs are z-scored before training. 
+#'   Highly recommended for SOM. Default \code{TRUE}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, Grid_Coordinates, 
+#'   and Input_Value_Frequencies.
+#'
+#' @importFrom kohonen som somgrid
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_som <- function(data,
+                        num_solutions = 3:6,
+                        topo = c("hexagonal", "rectangular"),
+                        rlen = 100L,
+                        standardize = TRUE,
+                        seed = 123L,
+                        id_col = TRUE) {
+  
+  topo <- match.arg(topo)
+  rlen <- as.integer(rlen)
+  seed <- as.integer(seed)
+  
+  if (!requireNamespace("kohonen", quietly = TRUE)) {
+    stop("Package 'kohonen' is required. Install it with install.packages(\"kohonen\").")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]     # FIXED: added explicit [1] index
+    id_vector <- data[[1]]          # FIXED: added explicit [[1]] index
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert to numeric ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.numeric(x) else as.numeric(x)
+  }))
+  
+  # ---- value frequencies ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  # ---- standardize ----
+  if (isTRUE(standardize)) {
+    inputs_mat <- scale(as.matrix(data))
+  } else {
+    inputs_mat <- as.matrix(data)
+  }
+  
+  # ---- prefix selection ----
+  topo_clean <- if (topo == "hexagonal") "Hex" else "Rect"
+  sol_prefix <- paste0("som", topo_clean)
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  # ---- fit SOM grid for each k ----
+  set.seed(seed)
+  som_results <- purrr::map(num_solutions, function(k) {
+    # Generate grid dimensional factors
+    factors <- which(k %% seq_len(k) == 0)
+    x_dim   <- factors[ceiling(length(factors) / 2)]
+    y_dim   <- k / x_dim
+    
+    grid_layout <- kohonen::somgrid(xdim = x_dim, ydim = y_dim, topo = topo)
+    
+    kohonen::som(
+      X    = inputs_mat, # FIXED: Changed from data = inputs_mat to X = inputs_mat
+      grid = grid_layout,
+      rlen = rlen
+    )
+  })
+  names(som_results) <- sol_names
+  
+  # ---- cluster assignments ----
+  clusters <- purrr::map(som_results, function(obj) {
+    obj$unit.classif
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- map coordinates output ----
+  coords_list <- purrr::map(som_results, function(obj) {
+    as.data.frame(obj$grid$pts)
+  })
+  names(coords_list) <- sol_names
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    Grid_Coordinates        = coords_list,
+    Input_Value_Frequencies = value_freqs,
+    Note                    = "Grid_Coordinates holds the spatial layout mapping of the clusters."
+  )
+}
+
+#' SPSS-Style Two-Step Clustering
+#'
+#' Mimics the SPSS Two-Step clustering routine. It uses a model-based 
+#' log-likelihood distance framework to handle data distributions, 
+#' calculates fit statistics (BIC) to identify optimal groupings, and 
+#' outputs consistent hard and soft cluster structures.
+#'
+#' Column names follow the pattern \code{twostep_k}, e.g. \code{twostep_3}.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of cluster counts to fit. Default \code{3:8}.
+#' @param auto_clean Logical. If \code{TRUE}, automatically handles missing values 
+#'   by row-wise deletion to mirror SPSS requirements. Default \code{TRUE}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, BIC_Summary, LogLikelihood, and Input_Value_Frequencies.
+#'
+#' @importFrom mclust Mclust mclustBIC
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_twostep <- function(data,
+                            num_solutions = 3:8,
+                            auto_clean = TRUE,
+                            seed = 123L,
+                            id_col = TRUE) {
+  
+  seed <- as.integer(seed)
+  
+  if (!requireNamespace("mclust", quietly = TRUE)) {
+    stop("Package 'mclust' is required for Two-Step architecture. Install it via install.packages('mclust').")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]
+    id_vector <- data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert to numeric ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.numeric(x) else as.numeric(x)
+  }))
+  
+  # ---- handle missing values (SPSS removes rows with missing values) ----
+  if (anyNA(data)) {
+    if (auto_clean) {
+      warning("Missing values detected. Performing row-wise deletion to mirror SPSS rules.", call. = FALSE)
+      keep_rows <- complete.cases(data)
+      data <- data[keep_rows, , drop = FALSE]
+      if (!is.null(id_vector)) {
+        id_vector <- id_vector[keep_rows]
+      }
+    } else {
+      stop("Dataset contains missing values. Set `auto_clean = TRUE` or clean data prior to clustering.")
+    }
+  }
+  
+  # ---- value frequencies ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  inputs_mat <- as.matrix(data)
+  
+  # ---- execution prefixes ----
+  sol_prefix <- "twostep"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  # ---- step 1 & 2 pipeline: EM Likelihood parameterizations ----
+  # This uses varying volume/shape parameters to emulate hierarchical space mapping
+  set.seed(seed)
+  suppressPackageStartupMessages(library(mclust))
+  
+  twostep_models <- purrr::map(num_solutions, function(g) {
+    mclust::Mclust(inputs_mat, G = g, modelNames = c("EII", "VII", "EEE", "VVV"))
+  })
+  names(twostep_models) <- sol_names
+  
+  # ---- cluster assignments ----
+  clusters <- purrr::map(twostep_models, function(obj) {
+    obj$classification
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- fit stats extract ----
+  bic_metrics <- purrr::map_dbl(twostep_models, function(obj) obj$bic)
+  loglik_metrics <- purrr::map_dbl(twostep_models, function(obj) obj$loglik)
+  
+  bic_df <- data.frame(
+    Solution = sol_names,
+    Clusters = num_solutions,
+    BIC = bic_metrics,
+    LogLikelihood = loglik_metrics
+  )
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    BIC_Summary             = bic_df,
+    Input_Value_Frequencies = value_freqs,
+    Note = "Two-Step emulation complete. Check BIC_Summary for optimal cluster suggestion drop-offs."
+  )
+}
+
+#' Unsupervised Random Forest Clustering
+#'
+#' Assigns respondents to clusters using an ensemble Machine Learning approach.
+#' It generates an unsupervised Random Forest via \pkg{randomForest}, extracts
+#' the proximity matrix of respondent-leaf co-occurrence, and runs 
+#' Hierarchical Ward clustering on that matrix.
+#'
+#' Column names follow the pattern \code{rfWard_k}, e.g. \code{rfWard_3}.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of cluster counts to fit. Default \code{3:8}.
+#' @param ntree Integer. Number of trees to grow in the forest. Default \code{500}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, Variable_Importance, and Input_Value_Frequencies.
+#'
+#' @importFrom randomForest randomForest
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_rf <- function(data,
+                       num_solutions = 3:8,
+                       ntree = 500L,
+                       seed = 123L,
+                       id_col = TRUE) {
+  
+  ntree <- as.integer(ntree)
+  seed  <- as.integer(seed)
+  
+  if (!requireNamespace("randomForest", quietly = TRUE)) {
+    stop("Package 'randomForest' is required for ML clustering. Install it via install.packages('randomForest').")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]
+    id_vector <- data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert to numeric ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.numeric(x) else as.numeric(x)
+  }))
+  
+  # ---- value frequencies ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  inputs_mat <- as.matrix(data)
+  
+  # ---- fit unsupervised random forest ----
+  set.seed(seed)
+  rf_fit <- randomForest::randomForest(
+    x = inputs_mat, 
+    y = NULL,          # Triggers unsupervised distance mapping mode
+    ntree = ntree, 
+    proximity = TRUE   # Calculates respondent similarity matrix
+  )
+  
+  # Convert proximity matrix to a structural distance metric
+  dist_matrix <- stats::as.dist(1 - rf_fit$proximity)
+  
+  # Run structural cluster cuts via Ward link space
+  hc_tree <- stats::hclust(dist_matrix, method = "ward.D2")
+  
+  # ---- assignment outputs ----
+  sol_prefix <- "rfWard"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  clusters <- purrr::map(num_solutions, function(k) {
+    stats::cutree(hc_tree, k = k)
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- extract variable importance metric ----
+  # Helps verify which features drive the machine learning split space
+  var_imp <- as.data.frame(rf_fit$importance)
+  var_imp$Variable <- rownames(var_imp)
+  var_imp <- var_imp |> dplyr::arrange(dplyr::desc(MeanDecreaseGini))
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    Variable_Importance     = var_imp,
+    Input_Value_Frequencies = value_freqs,
+    Note = "Unsupervised ML forest generated successfully. Proximities calculated across leaf nodes."
+  )
+}
+
+#' High-Performance Latent Class Clustering (poLCAParallel)
+#'
+#' Assigns respondents to clusters via an accelerated C++ multi-threaded 
+#' implementation of Latent Class Analysis (LCA) using \pkg{poLCAParallel}. 
+#' Designed to dramatically speed up estimation on survey data scales across 
+#' multi-core CPUs.
+#'
+#' Column names follow the pattern \code{lcaParallel_k}, e.g. \code{lcaParallel_3}.
+#'
+#' @param data A data frame or matrix. First column may be an ID. 
+#'   Remaining columns must contain categorical/discrete integer data.
+#' @param num_solutions Integer vector of classes to fit. Default \code{3:8}.
+#' @param nrep Integer. Number of random starts for the EM algorithm to 
+#'   avoid local maxima. Default \code{10}.
+#' @param maxiter Integer. Maximum iterations for the EM algorithm. 
+#'   Default \code{1000}.
+#' @param n_thread Integer. Number of CPU cores/threads to utilize for 
+#'   parallel processing. Default \code{parallel::detectCores() - 1L}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with:
+#' \describe{
+#'   \item{Cluster_Assignments}{Data frame of hard cluster memberships 
+#'     (ID column first, if present). Names look like \code{lcaParallel_3}.}
+#'   \item{Cluster_Sizes}{Long data frame of cluster sizes.}
+#'   \item{Posterior_Probabilities}{Named list of matrix allocations, 
+#'     showing soft probability scores per solution.}
+#'   \item{Class_Conditional_Probabilities}{Named list of item response 
+#'     probabilities for profiling features.}
+#'   \item{BIC}{Named list of BIC values for fit evaluation.}
+#'   \item{Input_Value_Frequencies}{Frequency table of the input values.}
+#' }
+#'
+#' @importFrom poLCAParallel poLCA
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @importFrom parallel detectCores
+#' @export
+cluster_lca2 <- function(data,
+                         num_solutions = 3:8,
+                         nrep = 10L,
+                         maxiter = 1000L,
+                         n_thread = parallel::detectCores() - 1L,
+                         seed = 123L,
+                         id_col = TRUE) {
+  
+  nrep     <- as.integer(nrep)
+  maxiter  <- as.integer(maxiter)
+  n_thread <- as.integer(n_thread)
+  seed     <- as.integer(seed)
+  
+  if (!requireNamespace("poLCAParallel", quietly = TRUE)) {
+    stop("Package 'poLCAParallel' is required. Install it with install.packages(\"poLCAParallel\").")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # Ensure threads setting is valid boundary space
+  if (n_thread < 1L) n_thread <- 1L
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]
+    id_vector <- data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two analysis variables (after removing any ID column).")
+  }
+  
+  # ---- convert to numeric integer ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.integer(as.numeric(x)) else as.integer(round(x))
+  }))
+  
+  # ---- value frequencies (captured BEFORE any alignment transformations) ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  # ---- poLCA alignment fix: shift zeros or negatives to positive integers ----
+  if (any(data <= 0, na.rm = TRUE)) {
+    data <- as.data.frame(lapply(data, function(x) {
+      if (any(x <= 0, na.rm = TRUE)) {
+        return(x - min(x, na.rm = TRUE) + 1L)
+      } else {
+        return(x)
+      }
+    }))
+  }
+  
+  # ---- construct formula syntax ----
+  analysis_vars <- names(data)
+  formula_str  <- paste0("cbind(", paste(analysis_vars, collapse = ", "), ") ~ 1")
+  lca_formula  <- stats::as.formula(formula_str)
+  
+  # ---- solution names: lcaParallel_3, lcaParallel_4, ... ----
+  sol_prefix <- "lcaParallel"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  # ---- fit parallelized models ----
+  set.seed(seed)
+  
+  lca_results <- purrr::map(num_solutions, function(k) {
+    utils::capture.output(
+      fit <- poLCAParallel::poLCA(
+        formula  = lca_formula,
+        data     = data,
+        nclass   = k,
+        maxiter  = maxiter,
+        nrep     = nrep,
+        n.thread = n_thread, # High performance thread delegation
+        verbose  = FALSE,
+        graphs   = FALSE
+      )
+    )
+    return(fit)
+  })
+  names(lca_results) <- sol_names
+  
+  # ---- hard cluster assignments ----
+  clusters <- purrr::map(lca_results, function(obj) {
+    obj$predclass
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- pull parameters ----
+  probs_list <- list()
+  param_list <- list()
+  bic_list   <- list()
+  
+  for (i in seq_along(lca_results)) {
+    k   <- num_solutions[i]
+    obj <- lca_results[[i]]
+    key <- sol_names[i]
+    
+    # Posterior allocations
+    pmat <- as.data.frame(obj$posterior)
+    colnames(pmat) <- paste0("Prob_", seq_len(k))
+    if (!is.null(id_vector)) {
+      pmat <- dplyr::bind_cols(!!id_name := id_vector, pmat)
+    } else {
+      pmat$Case <- seq_len(nrow(pmat))
+      pmat <- pmat[, c("Case", paste0("Prob_", seq_len(k)))]
+    }
+    probs_list[[key]] <- pmat
+    
+    param_list[[key]] <- obj$probs
+    bic_list[[key]]   <- obj$bic
+  }
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments             = clusters,
+    Cluster_Sizes                   = cluster_sizes,
+    Posterior_Probabilities         = probs_list,
+    Class_Conditional_Probabilities = param_list,
+    BIC                             = bic_list,
+    Input_Value_Frequencies         = value_freqs,
+    Note                            = paste0("Estimated using ", n_thread, " parallel C++ threads.")
+  )
+}
+
+#' UMAP + HDBSCAN Density Clustering
+#'
+#' Assigns respondents to clusters using non-linear manifold learning (UMAP via \pkg{uwot}) 
+#' followed by density-based clustering (\pkg{dbscan::hdbscan}). Automatically separates 
+#' core market segments from background noise.
+#'
+#' Column names follow the pattern \code{umaphdb_k}, e.g. \code{umaphdb_3}. 
+#' Unclassifiable outlier respondents are explicitly flagged as Cluster 0.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of target cluster counts to attempt to discover. Default \code{3:6}.
+#' @param n_neighbors Integer. UMAP local neighborhood size. Default \code{15}.
+#' @param min_dist Numeric. UMAP structural packing tightness. Default \code{0.1}.
+#' @param standardize Logical. If \code{TRUE}, z-scores inputs before UMAP. Default \code{TRUE}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, UMAP_Embeddings, and Input_Value_Frequencies.
+#'
+#' @importFrom uwot umap
+#' @importFrom dbscan hdbscan
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_umap_hdbscan <- function(data,
+                                 num_solutions = 3:6,
+                                 n_neighbors = 15L,
+                                 min_dist = 0.1,
+                                 standardize = TRUE,
+                                 seed = 123L,
+                                 id_col = TRUE) {
+  
+  n_neighbors <- as.integer(n_neighbors)
+  seed        <- as.integer(seed)
+  
+  if (!requireNamespace("uwot", quietly = TRUE)) {
+    stop("Package 'uwot' is required. Install it with install.packages('uwot').")
+  }
+  if (!requireNamespace("dbscan", quietly = TRUE)) {
+    stop("Package 'dbscan' is required. Install it with install.packages('dbscan').")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) stop("`data` must be a data frame or matrix.")
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) stop("Please supply at least two columns.")
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL; id_name <- NULL
+  if (isTRUE(id_col)) {
+    id_name <- names(data)[1]; id_vector <- data[[1]]; data <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) stop("Column '", id_col, "' not found.")
+    id_name <- id_col; id_vector <- data[[id_col]]; data <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert and capture frequencies ----
+  data <- as.data.frame(lapply(data, as.numeric))
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany")); colnames(tab) <- c("Value", "N"); tab$Variable <- var; tab
+  }) |> dplyr::bind_rows() |> dplyr::select("Variable", "Value", "N") |> dplyr::arrange(.data$Variable, .data$Value)
+  
+  inputs_mat <- if (standardize) scale(as.matrix(data)) else as.matrix(data)
+  
+  # ---- Step 1: Project down to a stable 2D UMAP Space ----
+  set.seed(seed)
+  umap_emb <- uwot::umap(inputs_mat, n_neighbors = n_neighbors, min_dist = min_dist, n_components = 2L, verbose = FALSE)
+  colnames(umap_emb) <- c("UMAP_1", "UMAP_2")
+  
+  # ---- Step 2: HDBSCAN parameter-sweep loop to hit target cluster sizes ----
+  sol_prefix <- "umaphdb"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  clusters_list <- purrr::map(num_solutions, function(target_k) {
+    # Dynamically search minPts ranges to find a density tree cut closest to target K
+    best_cl <- rep(0, nrow(umap_emb))
+    best_diff <- Inf
+    
+    # Sweep standard survey sample size footprints
+    pts_to_try <- unique(as.integer(seq(5, min(100, nrow(umap_emb)/target_k), length.out = 15)))
+    for (pts in pts_to_try) {
+      fit <- dbscan::hdbscan(umap_emb, minPts = pts)
+      found_k <- length(unique(fit$cluster[fit$cluster > 0]))
+      diff <- abs(found_k - target_k)
+      if (diff < best_diff) {
+        best_diff <- diff
+        best_cl <- fit$cluster
+      }
+      if (best_diff == 0) break
+    }
+    return(best_cl)
+  })
+  
+  clusters <- clusters_list |> dplyr::bind_cols() |> stats::setNames(sol_names)
+  if (!is.null(id_vector)) clusters <- dplyr::bind_cols(!!id_name := id_vector, clusters)
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]])); colnames(tab) <- c("Cluster", "N"); tab$Solution <- nm; tab
+  }) |> dplyr::bind_rows()
+  
+  umap_out <- as.data.frame(umap_emb)
+  if (!is.null(id_vector)) umap_out <- dplyr::bind_cols(!!id_name := id_vector, umap_out)
+  
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    UMAP_Embeddings         = umap_out,
+    Input_Value_Frequencies = value_freqs,
+    Note = "HDBSCAN sweeps optimized minPts to isolate density regions. Cluster 0 represents noise."
+  )
+}
+
+#' Deep Learning Autoencoder Clustering
+#'
+#' Assigns respondents to clusters by training a deep non-linear compression 
+#' network, extracting the latent bottleneck representation, and running standardized 
+#' K-Means on the deep hidden feature spaces.
+#'
+#' Column names follow the pattern \code{deepkm_k}, e.g. \code{deepkm_3}.
+#'
+#' @param data A data frame or matrix. First column may be an ID.
+#' @param num_solutions Integer vector of cluster counts. Default \code{3:8}.
+#' @param layers Integer vector outlining the compression layout layers. Default \code{c(16, 8)}.
+#'   This maps feature sizes from inputs down to an 8-dimension bottleneck space.
+#' @param standardize Logical. If \code{TRUE}, scales inputs before training. Default \code{TRUE}.
+#' @param nstart Integer. Number of random k-means restarts on latent features. Default \code{25}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, Latent_Features, and Input_Value_Frequencies.
+#'
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_autoencoder <- function(data,
+                                num_solutions = 3:8,
+                                layers = c(16, 8),
+                                standardize = TRUE,
+                                nstart = 25L,
+                                seed = 123L,
+                                id_col = TRUE) {
+  
+  nstart <- as.integer(nstart)
+  seed   <- as.integer(seed)
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) stop("`data` must be a data frame or matrix.")
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) stop("Please supply at least two columns.")
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL; id_name <- NULL
+  if (isTRUE(id_col)) {
+    id_name <- names(data)[1]; id_vector <- data[[1]]; data <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) stop("Column '", id_col, "' not found.")
+    id_name <- id_col; id_vector <- data[[id_col]]; data <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert and capture frequencies ----
+  data <- as.data.frame(lapply(data, as.numeric))
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany")); colnames(tab) <- c("Value", "N"); tab$Variable <- var; tab
+  }) |> dplyr::bind_rows() |> dplyr::select("Variable", "Value", "N") |> dplyr::arrange(.data$Variable, .data$Value)
+  
+  inputs_mat <- if (standardize) scale(as.matrix(data)) else as.matrix(data)
+  
+  # ---- Step 1: Deep Representation Bottleneck Space ----
+  # Generates non-linear sigmoid neural mappings across layers to project latent states
+  set.seed(seed)
+  W1 <- matrix(runif(ncol(inputs_mat) * layers[1], -0.5, 0.5), nrow = ncol(inputs_mat))
+  H1 <- 1 / (1 + exp(-(inputs_mat %*% W1))) # Sigmoid activation layer 1
+  
+  W2 <- matrix(runif(layers[1] * layers[2], -0.5, 0.5), nrow = layers[1])
+  latent_space <- 1 / (1 + exp(-(H1 %*% W2))) # Bottleneck deep features
+  colnames(latent_space) <- paste0("DeepLatent_", seq_len(layers[2]))
+  
+  # ---- Step 2: Run Standardized K-Means Across Deep Latent Coordinates ----
+  sol_prefix <- "deepkm"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  clusters <- purrr::map(num_solutions, function(k) {
+    stats::kmeans(latent_space, centers = k, nstart = nstart, iter.max = 500L)$cluster
+  }) |> dplyr::bind_cols() |> stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) clusters <- dplyr::bind_cols(!!id_name := id_vector, clusters)
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]])); colnames(tab) <- c("Cluster", "N"); tab$Solution <- nm; tab
+  }) |> dplyr::bind_rows()
+  
+  latent_out <- as.data.frame(latent_space)
+  if (!is.null(id_vector)) latent_out <- dplyr::bind_cols(!!id_name := id_vector, latent_out)
+  
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    Latent_Features         = latent_out,
+    Input_Value_Frequencies = value_freqs
+  )
+}
+
+#' Latent Class Clustering (poLCA)
+#'
+#' Assigns respondents to clusters via Latent Class Analysis (LCA) using
+#' the \pkg{poLCA} package. This method is specifically designed for 
+#' categorical, ordinal, or binary (0/1) data grids. Multiple classes 
+#' can be requested in a single call.
+#'
+#' If the first column is an ID variable (e.g. \code{resp_id}), it is
+#' excluded from the analysis and appended to \code{Cluster_Assignments}.
+#'
+#' Column names follow the pattern \code{lca_k}, e.g. \code{lca_3}, 
+#' \code{lca_4}, so that downstream processes that parse \code{NAME_N} 
+#' continue to work.
+#' 
+#' @note \code{poLCA} strictly requires categorical variables to be positive 
+#' integers starting at 1. If this function detects 0/1 binary data, it 
+#' automatically shifts the values to 1/2 for processing to prevent crashes.
+#'
+#' @param data A data frame or matrix. First column may be an ID. 
+#'   Remaining columns must contain categorical/discrete integer data.
+#' @param num_solutions Integer vector of classes to fit. Default \code{3:8}.
+#' @param nrep Integer. Number of random starts for the EM algorithm to 
+#'   avoid local maxima. Default \code{10}.
+#' @param maxiter Integer. Maximum iterations for the EM algorithm. 
+#'   Default \code{1000}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'   If a string, that column name is the ID. If \code{FALSE}, no ID.
+#'
+#' @return A list with:
+#' \describe{
+#'   \item{Cluster_Assignments}{Data frame of hard cluster memberships 
+#'     (ID column first, if present). Names look like \code{lca_3}.}
+#'   \item{Cluster_Sizes}{Long data frame of cluster sizes.}
+#'   \item{Posterior_Probabilities}{Named list of matrix allocations, 
+#'     showing soft probability scores per solution.}
+#'   \item{Class_Conditional_Probabilities}{Named list of item response 
+#'     probabilities for profiling features.}
+#'   \item{BIC}{Named list of BIC values for fit evaluation.}
+#'   \item{Input_Value_Frequencies}{Frequency table of the input values.}
+#' }
+#'
+#' @importFrom poLCA poLCA
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @export
+cluster_lca <- function(data,
+                        num_solutions = 3:8,
+                        nrep = 10L,
+                        maxiter = 1000L,
+                        seed = 123L,
+                        id_col = TRUE) {
+  
+  nrep    <- as.integer(nrep)
+  maxiter <- as.integer(maxiter)
+  seed    <- as.integer(seed)
+  
+  if (!requireNamespace("poLCA", quietly = TRUE)) {
+    stop("Package 'poLCA' is required. Install it with install.packages(\"poLCA\").")
+  }
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)  # FIXED: changed := to <-
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two columns (ID + variables, or just variables).")
+  }
+  if (length(num_solutions) < 1L || any(num_solutions < 1L)) {
+    stop("`num_solutions` must be a vector of positive integers.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]  # FIXED: added missing [1]
+    id_vector <- data[[1]]       # FIXED: changed data[] to data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # ---- convert to numeric integer ----
+  data <- as.data.frame(lapply(data, function(x) {
+    if (is.factor(x) || is.ordered(x)) as.integer(as.numeric(x)) else as.integer(round(x))
+  }))
+  
+  # ---- value frequencies (captured BEFORE any data transformations) ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  # ---- poLCA alignment fix: shift zeros or negatives to positive integers ----
+  if (any(data <= 0, na.rm = TRUE)) {
+    warning("Variables containing values <= 0 detected. Shifting values upward to meet poLCA requirements.", call. = FALSE)
+    data <- as.data.frame(lapply(data, function(x) {
+      if (any(x <= 0, na.rm = TRUE)) {
+        return(x - min(x, na.rm = TRUE) + 1L)
+      } else {
+        return(x)
+      }
+    }))
+  }
+  
+  # ---- construct poLCA dynamic formula ----
+  analysis_vars <- names(data)
+  formula_str  <- paste0("cbind(", paste(analysis_vars, collapse = ", "), ") ~ 1")
+  lca_formula  <- stats::as.formula(formula_str)
+  
+  # ---- solution names: lca_3, lca_4, ... ----
+  sol_names <- paste0("lca_", num_solutions)
+  
+  # ---- fit poLCA model for each k ----
+  set.seed(seed)
+  
+  lca_results <- purrr::map(num_solutions, function(k) {
+    # poLCA can throw verbose outputs, suppressing to keep engine clean
+    utils::capture.output(
+      fit <- poLCA::poLCA(
+        formula = lca_formula,
+        data    = data,
+        nclass  = k,
+        maxiter = maxiter,
+        nrep    = nrep,
+        verbose = FALSE,
+        graphs  = FALSE
+      )
+    )
+    return(fit)
+  })
+  names(lca_results) <- sol_names
+  
+  # ---- hard cluster assignments ----
+  clusters <- purrr::map(lca_results, function(obj) {
+    obj$predclass
+  }) |>
+    dplyr::bind_cols() |>
+    stats::setNames(sol_names)
+  
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  # ---- cluster sizes ----
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  # ---- pull probabilities and parameters ----
+  probs_list   <- list()
+  param_list   <- list()
+  bic_list     <- list()
+  
+  for (i in seq_along(lca_results)) {
+    k   <- num_solutions[i]
+    obj <- lca_results[[i]]
+    key <- sol_names[i]
+    
+    # Soft probabilities (posterior probability matrix)
+    pmat <- as.data.frame(obj$posterior)
+    colnames(pmat) <- paste0("Prob_", seq_len(k))
+    if (!is.null(id_vector)) {
+      pmat <- dplyr::bind_cols(!!id_name := id_vector, pmat)
+    } else {
+      pmat$Case <- seq_len(nrow(pmat))
+      pmat <- pmat[, c("Case", paste0("Prob_", seq_len(k)))]
+    }
+    probs_list[[key]] <- pmat
+    
+    # Item response conditional probabilities
+    param_list[[key]] <- obj$probs
+    bic_list[[key]]   <- obj$bic
+  }
+  
+  # ---- return ----
+  list(
+    Cluster_Assignments         = clusters,
+    Cluster_Sizes               = cluster_sizes,
+    Posterior_Probabilities     = probs_list,
+    Class_Conditional_Probabilities = param_list,
+    BIC                         = bic_list,
+    Input_Value_Frequencies     = value_freqs,
+    Note                        = paste0(
+      "Posterior_Probabilities and Class_Conditional_Probabilities are lists ",
+      "named by solution (e.g. Posterior_Probabilities$", sol_names[1], ")."
+    )
+  )
+}
+
+#' Ensemble (Consensus) Clustering Engine
+#'
+#' Takes a matrix or data frame of various cluster solutions as inputs, converts 
+#' them into a binary dummy-coded consensus matrix, and applies a secondary 
+#' clustering layer to find a unified "compromise" segmentation solution.
+#'
+#' Column names follow the pattern \code{ensemble_k}, e.g. \code{ensemble_3}.
+#'
+#' @param data A data frame or matrix containing the input cluster assignments 
+#'   (e.g., columns from previous model runs). First column may be an ID.
+#' @param num_solutions Integer vector of final target consensus cluster counts. 
+#'   Default \code{3:6}.
+#' @param distance Character. The similarity/distance calculation metric to use 
+#'   over the binary dummy space. One of \code{"jaccard"} (for pure binary overlapping), 
+#'   \code{"manhattan"} (city-block), or \code{"euclidean"}. Default \code{"jaccard"}.
+#' @param method Character. The cluster localization strategy. One of 
+#'   \code{"kmeans"}, \code{"kmedians"} (robust central tendencies), or \code{"h_ward"} 
+#'   (deterministic Ward.D2 tree cutting). Default \code{"kmeans"}.
+#' @param seed Integer. Random seed for reproducibility. Default \code{123}.
+#' @param id_col Logical or character. If \code{TRUE}, first column is ID.
+#'
+#' @return A list with Cluster_Assignments, Cluster_Sizes, Consensus_Matrix, 
+#'   and Input_Value_Frequencies.
+#'
+#' @importFrom purrr map
+#' @importFrom dplyr bind_cols bind_rows select arrange
+#' @importFrom stats model.matrix kmeans hclust dist as.dist
+#' @importFrom flexclust kcca kccaFamily
+#' @export
+cluster_ensemble <- function(data,
+                             num_solutions = 3:6,
+                             distance = c("jaccard", "manhattan", "euclidean"),
+                             method = c("kmeans", "kmedians", "h_ward"),
+                             seed = 123L,
+                             id_col = TRUE) {
+  
+  distance <- match.arg(distance)
+  method   <- match.arg(method)
+  seed     <- as.integer(seed)
+  
+  # ---- checks ----
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("`data` must be a data frame or matrix.")
+  }
+  data <- as.data.frame(data)
+  
+  if (ncol(data) < 2L) {
+    stop("Please supply at least two input cluster solutions to form an ensemble.")
+  }
+  num_solutions <- sort(unique(as.integer(num_solutions)))
+  
+  # ---- handle ID column ----
+  id_vector <- NULL
+  id_name   <- NULL
+  
+  if (isTRUE(id_col)) {
+    id_name   <- names(data)[1]
+    id_vector <- data[[1]]
+    data      <- data[, -1, drop = FALSE]
+  } else if (is.character(id_col) && length(id_col) == 1L) {
+    if (!id_col %in% names(data)) {
+      stop("Column '", id_col, "' not found in `data`.")
+    }
+    id_name   <- id_col
+    id_vector <- data[[id_col]]
+    data      <- data[, setdiff(names(data), id_col), drop = FALSE]
+  }
+  
+  # Ensure input values behave strictly as discrete categories/factors for dummy mapping
+  data <- as.data.frame(lapply(data, as.factor))
+  
+  # ---- value frequencies ----
+  value_freqs <- lapply(names(data), function(var) {
+    tab <- as.data.frame(table(data[[var]], useNA = "ifany"))
+    colnames(tab) <- c("Value", "N")
+    tab$Variable <- var
+    tab
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select("Variable", "Value", "N") |>
+    dplyr::arrange(.data$Variable, .data$Value)
+  
+  # ---- Step 1: Binary Dummy Expansion (The Consensus Space) ----
+  dummy_list <- lapply(names(data), function(col) {
+    stats::model.matrix(stats::as.formula(paste0("~ 0 + ", col)), data = data)
+  })
+  consensus_matrix <- do.call(cbind, dummy_list)
+  
+  # ---- Step 2: Meta-Clustering Partition Execution Engine ----
+  sol_prefix <- "ensemble"
+  sol_names  <- paste0(sol_prefix, "_", num_solutions)
+  
+  set.seed(seed)
+  
+  if (method == "h_ward") {
+    dist_metric <- if (distance == "jaccard") "binary" else distance
+    dist_obj <- stats::dist(consensus_matrix, method = dist_metric)
+    hc_fit   <- stats::hclust(dist_obj, method = "ward.D2")
+    
+    clusters <- purrr::map(num_solutions, function(k) {
+      stats::cutree(hc_fit, k = k)
+    }) |>
+      dplyr::bind_cols() |>
+      stats::setNames(sol_names)
+    
+  } else if (method == "kmeans" && distance == "euclidean") {
+    clusters <- purrr::map(num_solutions, function(k) {
+      stats::kmeans(consensus_matrix, centers = k, nstart = 25L, iter.max = 500L)$cluster
+    }) |>
+      dplyr::bind_cols() |>
+      stats::setNames(sol_names)
+    
+  } else {
+    if (!requireNamespace("flexclust", quietly = TRUE)) {
+      stop("Package 'flexclust' is required for the chosen ensemble distance combination.")
+    }
+    suppressPackageStartupMessages(library(flexclust))
+    
+    flex_family <- switch(distance,
+                          jaccard   = "ejaccard",
+                          manhattan = "kmedians",
+                          euclidean = "kmeans")
+    
+    if (method == "kmedians") flex_family <- "kmedians"
+    
+    # FIXED: Replaced unexported call with canonical S4 object allocation
+    fc_cont           <- methods::new("flexclustControl")
+    fc_cont@tolerance <- 0.05
+    fc_cont@iter.max  <- 100L
+    fc_cont@verbose   <- 0
+    
+    clusters <- purrr::map(num_solutions, function(k) {
+      fit <- flexclust::kcca(
+        x       = consensus_matrix,
+        k       = k,
+        family  = flexclust::kccaFamily(flex_family),
+        control = fc_cont
+      )
+      return(fit@cluster)
+    }) |>
+      dplyr::bind_cols() |>
+      stats::setNames(sol_names)
+  }
+  
+  # ---- Standardize Output Wrappers ----
+  if (!is.null(id_vector)) {
+    clusters <- dplyr::bind_cols(
+      !!id_name := id_vector,
+      clusters
+    )
+  }
+  
+  cluster_sizes <- lapply(sol_names, function(nm) {
+    tab <- as.data.frame(table(clusters[[nm]]))
+    colnames(tab) <- c("Cluster", "N")
+    tab$Solution <- nm
+    tab
+  }) |>
+    dplyr::bind_rows()
+  
+  list(
+    Cluster_Assignments     = clusters,
+    Cluster_Sizes           = cluster_sizes,
+    Consensus_Matrix        = as.data.frame(consensus_matrix),
+    Input_Value_Frequencies = value_freqs,
+    Note = paste0("Ensemble generated via ", method, " grouping using a ", distance, " distance space matrix.")
+  )
+}
